@@ -19,10 +19,10 @@ except ImportError:
         return decorator
     prange = range
 
-st.set_page_config(layout="wide", page_title="SonarSim Pro (Strict)")
+st.set_page_config(layout="wide", page_title="SideEye")
 
 # ==============================================================================
-# PART 2: IMMUTABLE PHYSICS ENGINE (PRESERVED)
+# PART 2: IMMUTABLE PHYSICS ENGINE
 # ==============================================================================
 
 @njit(fastmath=False)
@@ -89,6 +89,7 @@ def simulate_rays_kernel(
             if dz <= 1e-9: continue
 
             # --- 1. ANALYTIC TARGET PRE-CHECK ---
+            # Determines if/where this ray hits a target before the floor
             t_target_min = 1e9
             hit_target_idx = -1
 
@@ -100,7 +101,7 @@ def simulate_rays_kernel(
                 t_size = targets_arr[t_idx, 3]
                 t_lift = targets_arr[t_idx, 4]
 
-                # Assume target is near the seabed for coarse check
+                # Target geometry assumes placement relative to the local floor
                 bathy_at_target = get_bathymetry_offset_jit(t_y, bathy_mode_id, 50.0)
                 z_floor_at_target = water_depth + bathy_at_target
                 z_bot = z_floor_at_target - t_lift
@@ -120,7 +121,6 @@ def simulate_rays_kernel(
                         t_cand = (-b - np.sqrt(delta)) / 2.0
                         if t_cand > 0: t_enter = t_cand    
                 else: # Box
-                    # Slab intersection method
                     if abs(ship_x - t_x) <= (t_size / 2.0):
                         t1 = (t_y - t_size/2.0) / dy; t2 = (t_y + t_size/2.0) / dy
                         t3 = (z_top) / dz; t4 = (z_bot) / dz
@@ -142,7 +142,6 @@ def simulate_rays_kernel(
             start_dist = min(dist_to_floor, t_target_min) - 5.0
             if start_dist < 0: start_dist = 0.0
 
-            # Align start_dist to dr grid
             step_start = int(start_dist / dr)
             current_dist = step_start * dr
 
@@ -151,7 +150,9 @@ def simulate_rays_kernel(
                 py = current_dist * dy
                 pz = current_dist * dz
 
-                # A. Target Hit
+                # A. Target Hit (Hard Block)
+                # If target is hit, we calculate response and BREAK.
+                # This prevents the ray from continuing to the floor (creating a shadow).
                 if current_dist >= t_target_min:
                     t_idx = hit_target_idx
                     t_type = int(targets_arr[t_idx, 0])
@@ -180,15 +181,23 @@ def simulate_rays_kernel(
 
                     ts_val = 0.0
                     if t_type == 0:
+                        # SPHERE PHYSICS: Rigid sphere Rayleigh regime scales as (ka)^4 (12 dB/oct).
+                        # Note: Dipole/compliant spheres scale as (ka)^6, but rigid is (ka)^4.
                         a = t_size / 2.0; ka = k_wavenumber * a
                         sigma = np.pi * a**2 * (ka**4) if ka < 1.0 else np.pi * a**2
                         ts_val = 10 * np.log10(sigma / (4 * np.pi) + 1e-12)
                     else:
+                        # BOX PHYSICS: Flat plate approximation
                         lam = 2 * np.pi / k_wavenumber; area = t_size * t_size
                         sigma_peak = 4 * np.pi * (area**2) / (lam**2 + 1e-9)
                         beta = (k_wavenumber * t_size * np.sin(np.radians(gamma_deg))) / 2.0
                         sinc_sq = 1.0 if abs(beta) < 1e-6 else (np.sin(beta) / beta)**2
                         sigma = sigma_peak * sinc_sq * (cos_gamma**2)
+
+                        # PHYSICS FIX: Geometric Clamp.
+                        # Prevents infinite RCS growth at high freq (Conservation of Energy).
+                        if sigma > area * 2.0: sigma = area * 2.0
+
                         ts_val = 10 * np.log10(sigma / (4 * np.pi) + 1e-12)
 
                     BS = max(10*np.log10(10**(ts_val/10) + 1e-9), -100.0)
@@ -214,14 +223,15 @@ def simulate_rays_kernel(
 
                 if pz >= local_depth:
                     local_slope = get_bathymetry_slope_jit(py, bathy_mode_id, 50.0)
-                    local_slope += texture_raw[p, tex_idx] * 0.1
+                    # PHYSICS FIX: Removed slope noise injection. Texture only affects BS amplitude.
+                    # local_slope += texture_raw[p, tex_idx] * 0.1 
+
                     norm_n = np.sqrt(local_slope**2 + 1)
                     n_y = -local_slope / norm_n; n_z = 1.0 / norm_n
                     cos_inc = max(-1.0, min(1.0, (dy * n_y) + (dz * n_z)))
                     grazing_rad = np.pi/2 - np.arccos(cos_inc)
 
                     if grazing_rad > 0:
-                        # --- PHYSICS UPGRADE: Continuous Specular + Lambertian ---
                         BS_lambert = sb_mu + sb_n * np.log10(np.sin(grazing_rad) + 1e-6)
 
                         inc_angle_rad = np.pi/2 - grazing_rad
@@ -249,7 +259,7 @@ def simulate_rays_kernel(
     return sonar_image
 
 # ==============================================================================
-# PART 3: PHYSICS CLASSES & ORCHESTRATION (PRESERVED)
+# PART 3: PHYSICS CLASSES & ORCHESTRATION
 # ==============================================================================
 
 class OceanMedium:
@@ -271,11 +281,11 @@ class SonarSystem:
     def __init__(self, freq_khz, beamwidth_vert_deg, aperture_horiz_m, cycles, tilt_angle_deg, max_range_override=None, medium=None):
         self.freq_khz = freq_khz
         self.freq_hz = freq_khz * 1000.0
-        c = medium.c if medium else 1500.0
-        self.wavelength = c / self.freq_hz
+        self.c = medium.c if medium else 1500.0
+        self.wavelength = self.c / self.freq_hz
         self.k = 2 * np.pi / self.wavelength
         self.pulse_len_s = cycles / self.freq_hz
-        self.dr = c * self.pulse_len_s / 2.0 
+        self.dr = self.c * self.pulse_len_s / 2.0 
         self.aperture_m = aperture_horiz_m
         self.bw_horiz_rad = self.wavelength / self.aperture_m
         self.bw_horiz_deg = np.degrees(self.bw_horiz_rad)
@@ -320,7 +330,7 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
     end_angle = sonar.tilt_rad + half_bw
     if start_angle < 0.01: start_angle = 0.01
 
-    rays_per_beam = 150 # Increased density for smoother fills
+    rays_per_beam = 150 
     delta_theta_rad = sonar.bw_vert_rad / rays_per_beam
     num_rays = int((end_angle - start_angle) / delta_theta_rad)
     if num_rays < 50: num_rays = 50
@@ -334,7 +344,6 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
     ray_gains = np.array(ray_gains, dtype=np.float64)
     ray_gains_db = 10 * np.log10(ray_gains + 1e-9)
 
-    # TL Calculation
     max_steps = int(sonar.max_range / sonar.dr) + 2
     steps_arr = np.arange(1, max_steps + 1, dtype=np.float64)
     dists_arr = steps_arr * sonar.dr
@@ -354,7 +363,7 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
     b_map = {"Flat": 0, "Slope": 1, "Mound": 2, "Trench": 3}
     b_mode_id = b_map.get(bottom_profile, 0)
 
-    # --- KERNEL EXECUTION (PURE PHYSICS) ---
+    # --- KERNEL EXECUTION ---
     sonar_image = simulate_rays_kernel(
         num_pings, ray_angles, ray_gains_db, tl_table, 
         step_size, sonar.dr, sonar.max_range,
@@ -362,17 +371,14 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
         float(sb_params['mu']), float(sb_params['n']), float(sonar.sl), float(sonar.k)
     )
 
-    # --- RECEIVER CHAIN (SIGNAL CONDITIONING) ---
-    # 1. Near-Field Blanking (Receiver Ring-Down)
+    # --- RECEIVER CHAIN ---
     ring_down_bins = int(2.0 / sonar.dr)
     if ring_down_bins > 0 and ring_down_bins < max_bins:
         sonar_image[:, :ring_down_bins] *= 0.05
 
-    # 2. Additive Noise (Before Normalization)
     noise_pwr = 10**(sonar.noise_floor/10.0)
     sonar_image += noise_pwr
 
-    # 3. Dynamic Range Normalization (Fixed Reference)
     min_ref_level = noise_pwr * 1e6
     signal_ref_level = np.percentile(sonar_image, 99.0)
     reference_level = max(signal_ref_level, min_ref_level)
@@ -403,34 +409,22 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
     return raw_power_output, sonar.dr, step_size, num_pings, alpha
 
 # ==============================================================================
-# PART 4: DISPLAY & POST-PROCESSING LAYER (STRICTLY STATELESS)
+# PART 4: DISPLAY & POST-PROCESSING
 # ==============================================================================
 
 def apply_post_processing(raw_img_input, display_params, physics_metadata):
-    """
-    Apply pure visualization transforms (Log, Contrast, Brightness).
-    NO adaptive logic allowed.
-    """
-    # 1. Work on a copy
     working_img = raw_img_input.copy()
-
-    # 2. Log Compression
     img_db = 10 * np.log10(working_img + 1e-10)
-
-    # 3. Brightness & Contrast (Linear Viz Only)
     contrast = display_params.get('contrast', 1.0)
     brightness = display_params.get('brightness', 0.0)
     img_db = (img_db * contrast) + brightness
-
-    # 4. Final Clipping
     vmin = display_params.get('clip_min', -60.0)
     vmax = display_params.get('clip_max', 0.0)
     img_final = np.clip(img_db, vmin, vmax)
-
     return img_final
 
 # ==============================================================================
-# PART 5: STREAMLIT UI (INVALIDATION LOGIC)
+# PART 5: STREAMLIT UI (REACTIVE SUMMARY)
 # ==============================================================================
 
 if 'sim_result' not in st.session_state:
@@ -438,110 +432,165 @@ if 'sim_result' not in st.session_state:
 if 'raw_data' not in st.session_state:
     st.session_state.raw_data = None
 
-# Callback to force re-simulation if physics params change
-def clear_sim():
+def touch_params():
     st.session_state.raw_data = None
-    st.session_state.sim_result = None
 
-st.sidebar.title("SonarSim Pro")
-
-# PROGRESS BAR PLACEHOLDER
-progress_bar = st.sidebar.progress(0)
-
-st.sidebar.markdown("---")
+st.sidebar.header("Settings")
 
 # --- PHYSICS CONTROLS ---
 with st.sidebar.expander("1. Physics Engine (Sim)", expanded=True):
-    # All physics widgets trigger clear_sim on change
-    # UPDATED: Speed in m/s
-    speed_mps = st.slider("Speed (m/s)", 0.5, 5.0, 1.5, on_change=clear_sim)
-    ping_rate = st.slider("Ping Rate (Hz)", 5.0, 30.0, 15.0, on_change=clear_sim)
-    aperture_len = st.number_input("Horiz Aperture (m)", 0.05, 1.0, 0.215, on_change=clear_sim)
-    freq = st.number_input("Freq (kHz)", 50.0, 1000.0, 400.0, on_change=clear_sim)
+    speed_mps = st.slider(
+        "Speed (m/s)", 0.5, 5.0, 1.5, on_change=touch_params,
+        help="Tow speed (v) relative to the seafloor. Affects along-track sampling density (DX)."
+    )
+    ping_rate = st.slider(
+        "Ping Rate (Hz)", 5.0, 30.0, 15.0, on_change=touch_params,
+        help="Pulse Repetition Frequency (PRF). Determines max unambiguous range (R_max = c / 2*PRF) and along-track resolution."
+    )
+    aperture_len = st.number_input(
+        "Horiz Aperture (m)", 0.05, 1.0, 0.215, on_change=touch_params,
+        help="Physical length of the receive array (L). Controls horizontal beamwidth (Theta_H approx Lambda/L) and azimuth resolution."
+    )
+    freq = st.number_input(
+        "Freq (kHz)", 50.0, 1000.0, 400.0, on_change=touch_params,
+        help="Acoustic center frequency (f_c). Determines wavelength (Lambda) and absorption loss (alpha). Higher freq = better resolution, shorter range."
+    )
 
     c1, c2 = st.columns(2)
-    with c1: b_type = st.selectbox("Seabed", ["Mud", "Sand", "Gravel", "Rock"], index=1, on_change=clear_sim)
-    with c2: b_profile = st.selectbox("Bathymetry", ["Flat", "Slope", "Mound", "Trench"], on_change=clear_sim)
-    roughness = st.slider("Texture (dB)", 0.0, 5.0, 1.0, on_change=clear_sim)
+    with c1: 
+        b_type = st.selectbox(
+            "Seabed", ["Mud", "Sand", "Gravel", "Rock"], index=1, on_change=touch_params,
+            help="Geoacoustic parameters: Impedance contrast and scattering strength (Lambertian mu/n)."
+        )
+    with c2: 
+        b_profile = st.selectbox(
+            "Bathymetry", ["Flat", "Slope", "Mound", "Trench"], on_change=touch_params,
+            help="Macro-scale seafloor geometry."
+        )
+    roughness = st.slider(
+        "Texture (dB)", 0.0, 5.0, 1.0, on_change=touch_params,
+        help="Statistical micro-roughness amplitude (Speckle noise parameter)."
+    )
 
-    limit_r = 40000.0 / freq
-    default_r = float(min(limit_r, 600.0))
-    max_r = st.number_input("Display Range (m)", 10.0, 1000.0, default_r, on_change=clear_sim)
+    # INSTANTIATE MEDIUM EARLY FOR UI CALCULATIONS (UNIFIED C)
+    water_depth = st.number_input(
+        "Water Depth (m)", 5.0, 100.0, 15.0, on_change=touch_params,
+        help="Altitude of the sensor (h) above the seafloor."
+    )
 
-    water_depth = st.number_input("Water Depth (m)", 5.0, 100.0, 15.0, on_change=clear_sim)
-    tilt_angle = st.slider("Tilt Angle (deg)", 0, 80, 46, on_change=clear_sim)
-    beam_v = st.slider("Vert Beam (deg)", 10, 90, 36, on_change=clear_sim)
-    num_cycles = st.slider("Cycles (N)", 2, 100, 40, on_change=clear_sim)
+    med_ui = OceanMedium(depth_m=water_depth)
+    c_sound = med_ui.c
+    limit_r = (c_sound / 2.0) / ping_rate * 0.95 # Safety margin
+    default_r = float(min(40000.0 / freq, 600.0))
+
+    max_r = st.number_input(
+        "Display Range (m)", 10.0, 1000.0, default_r, on_change=touch_params,
+        help="Maximum slant range to simulate. Must be less than c / 2*PRF to avoid aliasing."
+    )
+
+    tilt_angle = st.slider(
+        "Tilt Angle (deg)", 0, 80, 46, on_change=touch_params,
+        help="Depression angle (phi) of the beam axis. 0=Horizontal, 90=Nadir."
+    )
+    beam_v = st.slider(
+        "Vert Beam (deg)", 10, 90, 36, on_change=touch_params,
+        help="Elevation beamwidth (-3dB). Controls swath coverage."
+    )
+    num_cycles = st.slider(
+        "Cycles (N)", 2, 100, 40, on_change=touch_params,
+        help="Pulse duration (tau = N/f). Defines range resolution (DR = c*tau/2)."
+    )
 
     st.markdown("**Targets**")
-    show_targets = st.checkbox("Enable Targets", value=True, on_change=clear_sim)
-    t1_type = st.selectbox("Type", ["Sphere", "Box"], on_change=clear_sim)
+    show_targets = st.checkbox("Enable Targets", value=True, on_change=touch_params)
+    t1_type = st.selectbox("Type", ["Sphere", "Box"], on_change=touch_params)
 
-    # KEYED SLIDER to preserve state
-    # Ensure initialization once
     if "target_y_pos" not in st.session_state:
         st.session_state.target_y_pos = 15.0
-
-    # Clamp BEFORE widget creation
-    st.session_state.target_y_pos = min(
-        st.session_state.target_y_pos,
-        float(max_r)
-    )
-
+    st.session_state.target_y_pos = min(st.session_state.target_y_pos, float(max_r))
     t1_y = st.slider(
-        "Cross Track Y",
-        0.0,
-        float(max_r),
-        st.session_state.target_y_pos,
-        key="target_y_pos",
-        on_change=clear_sim
+        "Cross Track Y", 0.0, float(max_r), st.session_state.target_y_pos,
+        key="target_y_pos", on_change=touch_params,
+        help="Target range from track."
     )
-
-    t1_s = st.number_input("Size (m)", 0.1, 5.0, 1.0, on_change=clear_sim)
-    t1_l = st.slider("Target Lift (m)", 0.0, 10.0, 0.0, on_change=clear_sim)
-
-    run_btn = st.button("RUN SIMULATION", type="primary")
+    t1_s = st.number_input(
+        "Size (m)", 0.1, 5.0, 1.0, on_change=touch_params,
+        help="Target characteristic dimension (Diameter or Side Length)."
+    )
+    t1_l = st.slider(
+        "Target Lift (m)", 0.0, 10.0, 0.0, on_change=touch_params,
+        help="Height of target above seafloor (creates acoustic shadow)."
+    )
 
 # --- DISPLAY CONTROLS (PURE VIZ) ---
 with st.sidebar.expander("2. Visualization", expanded=True):
-    # These controls do NOT clear simulation
-    contrast = st.slider("Contrast", 0.5, 3.0, 1.0)
-    brightness = st.slider("Brightness (dB Offset)", -50.0, 50.0, 0.0)
-    c_min, c_max = st.slider("dB Clipping Range", -100.0, 20.0, (-60.0, 0.0))
+    contrast = st.slider("Contrast", 0.5, 3.0, 1.0, 
+                         help="Linear contrast stretch applied to dB image.")
+    brightness = st.slider("Brightness (dB Offset)", -50.0, 50.0, 0.0,
+                           help="Global gain offset applied to dB image.")
+    c_min, c_max = st.slider("dB Clipping Range", -100.0, 20.0, (-60.0, 0.0),
+                             help="Dynamic range limits. Values below Min are black, above Max are white.")
 
-display_params = {
-    'contrast': contrast,
-    'brightness': brightness,
-    'clip_min': c_min,
-    'clip_max': c_max
-}
+# --- HEADER & LAYOUT ---
+st.markdown(
+    '<div class="fixed-title">SideEye</div>', 
+    unsafe_allow_html=True
+)
 
-# --- DERIVED PHYSICS PARAMS ---
-c_approx = 1500.0
-pulse_len_us = (num_cycles / (freq * 1000.0)) * 1e6
-wavelength_approx = c_approx / (freq * 1000.0)
-beam_h_deg_disp = np.degrees(wavelength_approx / aperture_len)
+st.markdown(
+    """
+    <style>
+    header[data-testid="stHeader"] {background-color: #0E1117 !important; z-index: 100000 !important;}
+    div[data-testid="stSidebarUserContent"] {padding-top: 1.5rem !important;}
+    .fixed-title {position: fixed; top: 14px; left: 380px; z-index: 999999; font-family: "Source Sans Pro", sans-serif; font-weight: 700; font-size: 32px; color: white; pointer-events: none;}
+    div[data-testid="stButton"] {position: fixed; top: 18px; left: 530px; z-index: 999999; width: auto !important; display: inline-block !important;}
+    div[data-testid="stButton"] button {width: auto !important; display: inline-block !important; padding-left: 20px !important; padding-right: 20px !important;}
+    div[data-testid="stProgress"] {position: fixed; top: 25px; left: 750px; width: 250px !important; z-index: 999999;}
+    .block-container {padding-top: 5rem !important;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# --- MAIN UI LOGIC ---
+run_btn = st.button("RUN SIMULATION", type="primary", help="Execute Ray Tracing Kernel")
+progress_bar = st.progress(0)
+
+display_params = {'contrast': contrast, 'brightness': brightness, 'clip_min': c_min, 'clip_max': c_max}
+
+# --- REACTIVE CALCS (USING UNIFIED SOUND SPEED) ---
+wavelength = c_sound / (freq * 1000.0)
+beam_h_rad = wavelength / aperture_len
+beam_h_deg = np.degrees(beam_h_rad)
 tilt_rad = np.radians(tilt_angle)
 half_beam_rad = np.radians(beam_v / 2)
 
+pulse_len_s = num_cycles / (freq * 1000.0)
+dr = c_sound * pulse_len_s / 2.0
+dx = speed_mps / ping_rate
+
+limit_ping_rate = c_sound / (2.0 * max_r)
+beam_width_at_max = max_r * beam_h_rad
+limit_min_rate = speed_mps / beam_width_at_max if beam_width_at_max > 0 else 999.0
+
 if run_btn:
     progress_bar.progress(10)
-    med = OceanMedium(depth_m=water_depth)
+    # Medium is already created as med_ui
     son = SonarSystem(freq_khz=freq, 
                       beamwidth_vert_deg=beam_v, 
                       aperture_horiz_m=aperture_len, 
                       cycles=num_cycles, 
                       tilt_angle_deg=tilt_angle, 
                       max_range_override=max_r, 
-                      medium=med)
+                      medium=med_ui)
 
     tgt = Target(t1_type, 10.0, t1_y, t1_s, lift_m=t1_l)
 
     progress_bar.progress(30)
     with st.spinner("Simulating Physics..."):
         # Pass MPS directly
-        raw, dr, dx, n_pings, alpha_val = run_physics_simulation(
-            son, med, [tgt], water_depth, 
+        raw, _, _, n_pings, alpha_val = run_physics_simulation(
+            son, med_ui, [tgt], water_depth, 
             ship_speed_mps=speed_mps, 
             ping_rate_hz=ping_rate,
             bottom_type=b_type,
@@ -554,29 +603,23 @@ if run_btn:
     progress_bar.progress(100)
     st.session_state.raw_data = raw
     st.session_state.sim_result = {'dr': dr, 'dx': dx, 'np': n_pings, 'alpha': alpha_val}
-    time.sleep(0.5) # Small visual delay for completion
+    time.sleep(0.5)
     progress_bar.empty()
-    st.rerun()
 
-# --- RENDERING ---
+# --- PLOTTING ---
 sim_track_len = 20.0
 top_ray_angle = tilt_rad - half_beam_rad 
-if top_ray_angle > 0.02: geom_slant_max = water_depth / np.sin(top_ray_angle)
-else: geom_slant_max = 40000.0 / freq 
+geom_slant_max = water_depth / np.sin(top_ray_angle) if top_ray_angle > 0.02 else 40000.0/freq 
 smart_plot_limit = min(geom_slant_max, max_r) * 1.1
-if smart_plot_limit > water_depth: plot_y_max = np.sqrt(smart_plot_limit**2 - water_depth**2)
-else: plot_y_max = 10.0 
+plot_y_max = np.sqrt(smart_plot_limit**2 - water_depth**2) if smart_plot_limit > water_depth else 10.0 
 view_depth_limit = water_depth + 5.0 
 
-# REDUCED HSPACE to close gaps
 fig = plt.figure(figsize=(14, 10))
 gs = GridSpec(2, 2, width_ratios=[plot_y_max, smart_plot_limit], height_ratios=[view_depth_limit, sim_track_len], wspace=0.1, hspace=0.05)
 
-# 1. CROSS SECTION
 ax_cross = fig.add_subplot(gs[0, 0])
-# Moved Title to TOP (cleaner layout)
 ax_cross.set_title("Cross Section (Y-Z)", fontweight='bold', pad=10)
-ax_cross.set_ylabel("Depth (m)")
+ax_cross.set_ylabel("Depth Z (m)")
 ax_cross.set_aspect('equal', adjustable='box')
 ax_cross.invert_yaxis()
 
@@ -592,124 +635,60 @@ bathy_z = water_depth + visual_bathy_local(bathy_y)
 ax_cross.plot(bathy_y, bathy_z, 'brown', lw=2)
 ax_cross.axhline(0, color='blue', ls='--')
 
-# Beam Visualization (Poly + Arcs)
-theta1 = tilt_rad - half_beam_rad
-theta2 = tilt_rad + half_beam_rad
-y1 = smart_plot_limit * np.cos(theta1); z1 = smart_plot_limit * np.sin(theta1)
-y2 = smart_plot_limit * np.cos(theta2); z2 = smart_plot_limit * np.sin(theta2)
-
-# Filled Wedge
-poly_points = [(0,0), (y1, z1), (y2, z2)]
-beam_wedge = patches.Polygon(poly_points, closed=True, color='green', alpha=0.1)
+theta1, theta2 = tilt_rad - half_beam_rad, tilt_rad + half_beam_rad
+y1, z1 = smart_plot_limit * np.cos(theta1), smart_plot_limit * np.sin(theta1)
+y2, z2 = smart_plot_limit * np.cos(theta2), smart_plot_limit * np.sin(theta2)
+beam_wedge = patches.Polygon([(0,0), (y1, z1), (y2, z2)], closed=True, color='green', alpha=0.1)
 ax_cross.add_patch(beam_wedge)
 ax_cross.plot([0, y1], [0, z1], 'g--', alpha=0.3)
 ax_cross.plot([0, y2], [0, z2], 'g--', alpha=0.3)
+cy, cz = smart_plot_limit * np.cos(tilt_rad), smart_plot_limit * np.sin(tilt_rad)
+ax_cross.plot([0, cy], [0, cz], 'r-.', alpha=0.4, lw=1)
 
-# ADDED: Center Line
-center_y = smart_plot_limit * np.cos(tilt_rad)
-center_z = smart_plot_limit * np.sin(tilt_rad)
-ax_cross.plot([0, center_y], [0, center_z], 'r-.', alpha=0.4, lw=1)
-
-# Clipped Arcs (Range Rings)
 arc_theta = np.linspace(theta1, theta2, 20)
 for r_circ in range(5, int(smart_plot_limit)+5, 5):
-    arc_y = r_circ * np.cos(arc_theta)
-    arc_z = r_circ * np.sin(arc_theta)
-    ax_cross.plot(arc_y, arc_z, color='gray', linestyle=':', alpha=0.5, lw=0.8)
+    ax_cross.plot(r_circ*np.cos(arc_theta), r_circ*np.sin(arc_theta), 'gray', ls=':', alpha=0.5, lw=0.8)
     if r_circ % 10 == 0 and r_circ < smart_plot_limit:
-        # CHANGED: Label on TOP ARM (theta1 is the top-most visual edge)
-        lbl_y = r_circ * np.cos(theta1)
-        lbl_z = r_circ * np.sin(theta1)
-        ax_cross.text(lbl_y, lbl_z, f"{r_circ}", 
-                      color='gray', fontsize=8, ha='right', va='bottom')
+        ax_cross.text(r_circ*np.cos(theta1), r_circ*np.sin(theta1), f"{r_circ}", color='gray', fontsize=8, ha='right', va='bottom')
 
 if show_targets:
-    if t1_type == "Box":
-        rect = patches.Rectangle((t1_y-t1_s/2, water_depth-t1_l-t1_s), t1_s, t1_s, color='black')
-        ax_cross.add_patch(rect)
-    else:
-        circ = patches.Circle((t1_y, water_depth-t1_l-t1_s/2), t1_s/2, color='black')
-        ax_cross.add_patch(circ)
+    if t1_type == "Box": ax_cross.add_patch(patches.Rectangle((t1_y-t1_s/2, water_depth-t1_l-t1_s), t1_s, t1_s, color='black'))
+    else: ax_cross.add_patch(patches.Circle((t1_y, water_depth-t1_l-t1_s/2), t1_s/2, color='black'))
 
 ax_cross.set_xlim(0, plot_y_max)
 ax_cross.set_ylim(view_depth_limit, -1) 
 
-# 2. SIMULATION SUMMARY PANEL (Top Right)
-ax_info = fig.add_subplot(gs[0, 1])
-ax_info.axis('off')
-ax_info.set_title("Simulation Summary", fontweight='bold')
+ax_info = fig.add_subplot(gs[0, 1]); ax_info.axis('off'); ax_info.set_title("Simulation Summary", fontweight='bold')
+warnings, status_color = [], "green"
+if ping_rate > limit_ping_rate: warnings.append(f"[!] TOO FAST: Ghost Echoes likely\n    Max phys rate: {limit_ping_rate:.1f} Hz"); status_color = "red"
+elif ping_rate < limit_min_rate: warnings.append(f"[!] TOO SLOW: Gaps in coverage\n    Min dense rate: {limit_min_rate:.1f} Hz"); status_color = "orange"
+if not warnings: warnings.append("✔ Parameters Optimal\n    Physics limits respected.\n    No spatial aliasing or gaps.")
 
-if st.session_state.raw_data is not None:
-    meta = st.session_state.sim_result
-    res_r = meta['dr'] * 100
-    res_a = meta['dx'] * 100
-    alpha_db = meta['alpha']
+info_text = f"--- STATUS: {status_color.upper()} ---\n"
+for w in warnings: info_text += f"{w}\n"
+info_text += "\n"
+info_text += f"--- SYSTEM CONFIG ---\nFreq:           {freq:.1f} kHz\nMax Range:      {max_r:.1f} m\nTilt / Depr:    {tilt_angle:.1f} deg\nBeam (H x V):   {beam_h_deg:.2f}° x {beam_v:.1f}°\nAperture (L):   {aperture_len:.3f} m\n\n"
+info_text += f"--- RESOLUTION ---\nRange Res (DR): {dr*100:.1f} cm (Fix)\nAzimuth Res:    {beam_width_at_max:.2f} m (@{max_r:.0f}m)\n\n"
+info_text += f"--- SAMPLING (GRID) ---\nPing Spacing (DX): {dx*100:.1f} cm\nPing Rate:      {ping_rate} Hz\nSpeed:          {speed_mps} m/s"
+ax_info.text(0.05, 0.95, info_text, transform=ax_info.transAxes, va='top', fontfamily='monospace', fontsize=10, bbox=dict(facecolor='white' if status_color=='green' else '#ffcccc', alpha=0.5, edgecolor='none'))
 
-    info_text = (
-        f"--- ACOUSTICS ---\n"
-        f"Frequency:      {freq:.1f} kHz\n"
-        f"Wavelength:     {wavelength_approx*100:.2f} cm\n"
-        f"Absorbtion:     {alpha_db:.2f} dB/km\n"
-        f"Beam (H x V):   {beam_h_deg_disp:.2f}° x {beam_v}°\n"
-        f"Pulse:          {num_cycles} cyc ({pulse_len_us:.1f} µs)\n\n"
-        f"--- RESOLUTION ---\n"
-        f"Range Res:      {res_r:.1f} cm\n"
-        f"Along-Track:    {res_a:.1f} cm\n\n"
-        f"--- GEOMETRY ---\n"
-        f"Max Phy Range:  {limit_r:.0f} m\n"
-        f"Disp Range:     {max_r:.1f} m\n"
-        f"Depression:     {tilt_angle}°\n"
-        f"Ping Rate:      {ping_rate} Hz @ {speed_mps} m/s"
-    )
-    ax_info.text(0.05, 0.95, info_text, transform=ax_info.transAxes, 
-                 verticalalignment='top', fontfamily='monospace', fontsize=10)
-else:
-    ax_info.text(0.5, 0.5, "Settings Changed.\nPress RUN to simulate.", ha='center', transform=ax_info.transAxes)
-
-# 3. TOP DOWN VIEW (Bottom Left)
 ax_top = fig.add_subplot(gs[1, 0], sharex=ax_cross)
-# MOVED TITLE DOWN to avoid X-axis conflict
 ax_top.text(0.5, -0.25, "Top Down (Ground Range)", transform=ax_top.transAxes, ha='center', va='top', fontsize=12, fontweight='bold')
-ax_top.set_xlabel("Across Track Y (m)")
-ax_top.set_ylabel("Along Track X (m)")
-ax_top.set_aspect('equal', adjustable='box')
-ax_top.set_xlim(0, plot_y_max)
-ax_top.set_ylim(0, sim_track_len)
-
+ax_top.set_xlabel("Across Track Y (m)"); ax_top.set_ylabel("Along Track X (m)"); ax_top.set_aspect('equal', adjustable='box')
+ax_top.set_xlim(0, plot_y_max); ax_top.set_ylim(0, sim_track_len)
 if show_targets:
-    tgt_x_pos = 10.0
-    if t1_type == "Box":
-        rect2 = patches.Rectangle((t1_y-t1_s/2, tgt_x_pos-t1_s/2), t1_s, t1_s, color='black')
-        ax_top.add_patch(rect2)
-    else:
-        circ2 = patches.Circle((t1_y, tgt_x_pos), t1_s/2, color='black')
-        ax_top.add_patch(circ2)
+    if t1_type == "Box": ax_top.add_patch(patches.Rectangle((t1_y-t1_s/2, 10.0-t1_s/2), t1_s, t1_s, color='black'))
+    else: ax_top.add_patch(patches.Circle((t1_y, 10.0), t1_s/2, color='black'))
 
-# 4. SONAR WATERFALL (Bottom Right)
 ax_sonar = fig.add_subplot(gs[1, 1], sharey=ax_top)
-# MOVED TITLE DOWN to avoid X-axis conflict
 ax_sonar.text(0.5, -0.25, "Sonar Image (Slant Range)", transform=ax_sonar.transAxes, ha='center', va='top', fontsize=12, fontweight='bold')
-ax_sonar.set_xlabel(f"Slant Range (m)")
-ax_sonar.set_aspect('equal', adjustable='box')
-ax_sonar.set_ylim(0, sim_track_len)
-ax_sonar.set_xlim(0, smart_plot_limit)
-
+ax_sonar.set_xlabel(f"Slant Range R (m)"); ax_sonar.set_aspect('equal', adjustable='box')
+ax_sonar.set_ylim(0, sim_track_len); ax_sonar.set_xlim(0, smart_plot_limit)
 if st.session_state.raw_data is not None:
-    # PASS A COPY TO PRESERVE PHYSICS
-    img_final = apply_post_processing(
-        st.session_state.raw_data.copy(), 
-        display_params, 
-        st.session_state.sim_result
-    )
-
-    ax_sonar.imshow(img_final, origin='lower', 
-                    extent=[0, max_r, 0, sim_track_len], 
-                    cmap='copper', 
-                    vmin=c_min, vmax=c_max)
+    img_final = apply_post_processing(st.session_state.raw_data.copy(), display_params, st.session_state.sim_result)
+    ax_sonar.imshow(img_final, origin='lower', extent=[0, max_r, 0, sim_track_len], cmap='copper', vmin=c_min, vmax=c_max)
 else:
-    # BLACK SCREEN ON INVALIDATION
     ax_sonar.set_facecolor('black')
-    ax_sonar.text(0.5, 0.5, "INVALIDATED", color='white', ha='center')
-
+    ax_sonar.text(0.5, 0.5, "Press RUN\nto Visualize", color='white', ha='center')
 plt.setp(ax_sonar.get_yticklabels(), visible=False)
 st.pyplot(fig)
