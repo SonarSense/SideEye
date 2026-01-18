@@ -506,7 +506,7 @@ with st.sidebar.expander("1. Physics Engine (Sim)", expanded=True):
     t1_type = st.selectbox("Type", ["Sphere", "Box"], on_change=touch_params)
 
     if "target_y_pos" not in st.session_state:
-        st.session_state.target_y_pos = 15.0
+        st.session_state.target_y_pos = 10.0
     st.session_state.target_y_pos = min(st.session_state.target_y_pos, float(max_r))
     t1_y = st.slider(
         "Cross Track Y", 0.0, float(max_r), st.session_state.target_y_pos,
@@ -518,7 +518,7 @@ with st.sidebar.expander("1. Physics Engine (Sim)", expanded=True):
         help="Target characteristic dimension (Diameter or Side Length)."
     )
     t1_l = st.slider(
-        "Target Lift (m)", 0.0, 10.0, 0.0, on_change=touch_params,
+        "Target Lift (m)", 0.0, 10.0, 4.0, on_change=touch_params,
         help="Height of target above seafloor (creates acoustic shadow)."
     )
 
@@ -692,3 +692,4 @@ else:
     ax_sonar.text(0.5, 0.5, "Press RUN\nto Visualize", color='white', ha='center')
 plt.setp(ax_sonar.get_yticklabels(), visible=False)
 st.pyplot(fig)
+
