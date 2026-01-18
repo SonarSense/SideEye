@@ -444,7 +444,7 @@ with st.sidebar.expander("1. Physics Engine (Sim)", expanded=True):
         help="Tow speed (v) relative to the seafloor. Affects along-track sampling density (DX)."
     )
     ping_rate = st.slider(
-        "Ping Rate (Hz)", 5.0, 30.0, 15.0, on_change=touch_params,
+        "Ping Rate (Hz)", 5.0, 30.0, 10.0, on_change=touch_params,
         help="Pulse Repetition Frequency (PRF). Determines max unambiguous range (R_max = c / 2*PRF) and along-track resolution."
     )
     aperture_len = st.number_input(
@@ -452,7 +452,7 @@ with st.sidebar.expander("1. Physics Engine (Sim)", expanded=True):
         help="Physical length of the receive array (L). Controls horizontal beamwidth (Theta_H approx Lambda/L) and azimuth resolution."
     )
     freq = st.number_input(
-        "Freq (kHz)", 50.0, 1000.0, 400.0, on_change=touch_params,
+        "Freq (kHz)", 50.0, 1000.0, 600.0, on_change=touch_params,
         help="Acoustic center frequency (f_c). Determines wavelength (Lambda) and absorption loss (alpha). Higher freq = better resolution, shorter range."
     )
 
@@ -526,7 +526,7 @@ with st.sidebar.expander("1. Physics Engine (Sim)", expanded=True):
 with st.sidebar.expander("2. Visualization", expanded=True):
     contrast = st.slider("Contrast", 0.5, 3.0, 1.0, 
                          help="Linear contrast stretch applied to dB image.")
-    brightness = st.slider("Brightness (dB Offset)", -50.0, 50.0, 0.0,
+    brightness = st.slider("Brightness (dB Offset)", -50.0, 50.0, -10.0,
                            help="Global gain offset applied to dB image.")
     c_min, c_max = st.slider("dB Clipping Range", -100.0, 20.0, (-60.0, 0.0),
                              help="Dynamic range limits. Values below Min are black, above Max are white.")
