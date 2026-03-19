@@ -49,19 +49,20 @@ def get_bathymetry_slope_jit(y, mode_id, max_y):
 
 @njit(parallel=HAVE_NUMBA, fastmath=False)
 def simulate_rays_kernel(
-    num_pings, 
-    ray_angles, 
-    ray_gains_db, 
-    tl_table, 
-    step_size, 
-    dr, max_range, 
-    water_depth, 
-    bathy_mode_id, 
-    targets_arr, 
-    texture_linear, 
-    texture_raw, 
-    sb_mu, sb_n, 
-    sl, 
+    num_pings,
+    ray_angles,
+    ray_gains_db,
+    tl_table,
+    step_size,
+    dr, max_range,
+    water_depth,
+    bathy_mode_id,
+    bathy_max_y,
+    targets_arr,
+    texture_linear,
+    texture_raw,
+    sb_mu, sb_n,
+    sl,
     k_wavenumber
 ):
     max_bins = int(max_range / dr)
@@ -102,7 +103,7 @@ def simulate_rays_kernel(
                 t_lift = targets_arr[t_idx, 4]
 
                 # Target geometry assumes placement relative to the local floor
-                bathy_at_target = get_bathymetry_offset_jit(t_y, bathy_mode_id, 50.0)
+                bathy_at_target = get_bathymetry_offset_jit(t_y, bathy_mode_id, bathy_max_y)
                 z_floor_at_target = water_depth + bathy_at_target
                 z_bot = z_floor_at_target - t_lift
                 z_top = z_bot - t_size
@@ -139,7 +140,7 @@ def simulate_rays_kernel(
 
             # OPTIMIZATION: Jump to near target or floor to save cycles
             dist_to_floor = water_depth / dz
-            start_dist = min(dist_to_floor, t_target_min) - 5.0
+            start_dist = min(dist_to_floor, t_target_min) - max(1.0, 2.0 * dr)
             if start_dist < 0: start_dist = 0.0
 
             step_start = int(start_dist / dr)
@@ -161,7 +162,7 @@ def simulate_rays_kernel(
                     t_size = targets_arr[t_idx, 3]
                     t_lift = targets_arr[t_idx, 4]
 
-                    bathy_at_target = get_bathymetry_offset_jit(t_y, bathy_mode_id, 50.0)
+                    bathy_at_target = get_bathymetry_offset_jit(t_y, bathy_mode_id, bathy_max_y)
                     z_floor_at_target = water_depth + bathy_at_target
                     z_bot = z_floor_at_target - t_lift
                     z_center = z_bot - t_size/2.0
@@ -181,10 +182,10 @@ def simulate_rays_kernel(
 
                     ts_val = 0.0
                     if t_type == 0:
-                        # SPHERE PHYSICS: Rigid sphere Rayleigh regime scales as (ka)^4 (12 dB/oct).
-                        # Note: Dipole/compliant spheres scale as (ka)^6, but rigid is (ka)^4.
+                        # SPHERE PHYSICS: Sigmoid blend between Rayleigh (ka^4) and geometric regimes.
                         a = t_size / 2.0; ka = k_wavenumber * a
-                        sigma = np.pi * a**2 * (ka**4) if ka < 1.0 else np.pi * a**2
+                        blend = 1.0 / (1.0 + np.exp(-6.0 * (ka - 1.0)))
+                        sigma = np.pi * a**2 * (ka**4 * (1.0 - blend) + 1.0 * blend)
                         ts_val = 10 * np.log10(sigma / (4 * np.pi) + 1e-12)
                     else:
                         # BOX PHYSICS: Flat plate approximation
@@ -218,11 +219,11 @@ def simulate_rays_kernel(
 
                 # B. Floor Hit
                 tex_idx = (i * 127 + step * 31) % max_bins
-                local_bathy_off = get_bathymetry_offset_jit(py, bathy_mode_id, 50.0)
+                local_bathy_off = get_bathymetry_offset_jit(py, bathy_mode_id, bathy_max_y)
                 local_depth = water_depth + local_bathy_off + (texture_raw[p, tex_idx] * 0.1)
 
                 if pz >= local_depth:
-                    local_slope = get_bathymetry_slope_jit(py, bathy_mode_id, 50.0)
+                    local_slope = get_bathymetry_slope_jit(py, bathy_mode_id, bathy_max_y)
                     # PHYSICS FIX: Removed slope noise injection. Texture only affects BS amplitude.
                     # local_slope += texture_raw[p, tex_idx] * 0.1 
 
@@ -347,7 +348,13 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
     max_steps = int(sonar.max_range / sonar.dr) + 2
     steps_arr = np.arange(1, max_steps + 1, dtype=np.float64)
     dists_arr = steps_arr * sonar.dr
-    tl_table = 40 * np.log10(dists_arr) + 2 * (alpha / 1000.0) * dists_arr
+    # Blended spreading: spherical near-field, cylindrical beyond transition (Lloyd mirror)
+    r_transition = np.pi * water_depth
+    tl_table = np.where(
+        dists_arr <= r_transition,
+        40 * np.log10(dists_arr),
+        40 * np.log10(r_transition) + 30 * np.log10(dists_arr / r_transition)
+    ) + 2 * (alpha / 1000.0) * dists_arr
 
     texture_map = np.random.normal(0, bottom_roughness, (num_pings, max_bins))
     texture_linear = 10**(texture_map / 10.0)
@@ -363,16 +370,19 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
     b_map = {"Flat": 0, "Slope": 1, "Mound": 2, "Trench": 3}
     b_mode_id = b_map.get(bottom_profile, 0)
 
+    bathy_max_y = np.sqrt(sonar.max_range**2 - water_depth**2) if sonar.max_range > water_depth else sonar.max_range
+
     # --- KERNEL EXECUTION ---
     sonar_image = simulate_rays_kernel(
-        num_pings, ray_angles, ray_gains_db, tl_table, 
+        num_pings, ray_angles, ray_gains_db, tl_table,
         step_size, sonar.dr, sonar.max_range,
-        water_depth, b_mode_id, targets_arr, texture_linear, texture_map,
+        water_depth, b_mode_id, bathy_max_y, targets_arr, texture_linear, texture_map,
         float(sb_params['mu']), float(sb_params['n']), float(sonar.sl), float(sonar.k)
     )
 
     # --- RECEIVER CHAIN ---
-    ring_down_bins = int(2.0 / sonar.dr)
+    ring_down_range = 3.0 * sonar.c * sonar.pulse_len_s / 2.0
+    ring_down_bins = int(ring_down_range / sonar.dr)
     if ring_down_bins > 0 and ring_down_bins < max_bins:
         sonar_image[:, :ring_down_bins] *= 0.05
 
@@ -394,11 +404,15 @@ def run_physics_simulation(sonar, medium, targets, water_depth, ship_speed_mps, 
         final_image = np.zeros_like(sonar_image)
         for b in range(max_bins):
             w = int(footprint_pings[b])
-            if w < 1: 
+            if w < 1:
                 final_image[:, b] = sonar_image[:, b]
             else:
                 col = sonar_image[:, b]
-                kernel = np.ones(w) / w 
+                sigma_k = max(w / 4.0, 0.5)
+                half = min(w, 3 * int(sigma_k) + 1, num_pings // 2)
+                x = np.arange(-half, half + 1, dtype=np.float64)
+                kernel = np.exp(-x**2 / (2 * sigma_k**2))
+                kernel /= kernel.sum()
                 conv_res = np.convolve(col, kernel, mode='full')[:len(col)]
                 final_image[:, b] = conv_res
 
@@ -437,137 +451,158 @@ def touch_params():
 
 st.sidebar.header("Settings")
 
-# --- PHYSICS CONTROLS ---
-with st.sidebar.expander("1. Physics Engine (Sim)", expanded=True):
-    speed_mps = st.slider(
-        "Speed (m/s)", 0.5, 5.0, 1.5, on_change=touch_params,
-        help="Tow speed (v) relative to the seafloor. Affects along-track sampling density (DX)."
+# --- SONAR SYSTEM ---
+with st.sidebar.expander("Sonar System", expanded=True):
+    freq = st.number_input(
+        "Frequency (kHz)", 50.0, 1000.0, 600.0, on_change=touch_params,
+        help="Center frequency. Higher = better resolution but shorter range. (f_c)"
     )
-    ping_rate = st.slider(
-        "Ping Rate (Hz)", 5.0, 30.0, 10.0, on_change=touch_params,
-        help="Pulse Repetition Frequency (PRF). Determines max unambiguous range (R_max = c / 2*PRF) and along-track resolution."
+    beam_v = st.slider(
+        "Vertical Beam (deg)", 10, 90, 36, on_change=touch_params,
+        help="Elevation beamwidth. Wider = more swath coverage. (-3 dB beamwidth)"
     )
     aperture_len = st.number_input(
         "Horiz Aperture (m)", 0.05, 1.0, 0.215, on_change=touch_params,
-        help="Physical length of the receive array (L). Controls horizontal beamwidth (Theta_H approx Lambda/L) and azimuth resolution."
+        help="Length of the receive array. Longer = narrower horizontal beam = sharper images. (L)"
     )
-    freq = st.number_input(
-        "Freq (kHz)", 50.0, 1000.0, 600.0, on_change=touch_params,
-        help="Acoustic center frequency (f_c). Determines wavelength (Lambda) and absorption loss (alpha). Higher freq = better resolution, shorter range."
+    num_cycles = st.slider(
+        "Pulse Cycles (N)", 2, 100, 40, on_change=touch_params,
+        help="More cycles = longer pulse = coarser range resolution but stronger echo. (tau = N/f)"
+    )
+    tilt_angle = st.slider(
+        "Tilt Angle (deg)", 0, 80, 46, on_change=touch_params,
+        help="Depression angle of the beam. 0 = horizontal, 90 = straight down (nadir)."
     )
 
+# --- ENVIRONMENT ---
+with st.sidebar.expander("Environment", expanded=True):
+    water_depth = st.number_input(
+        "Water Depth (m)", 5.0, 100.0, 15.0, on_change=touch_params,
+        help="Sensor altitude above the seafloor."
+    )
+    water_temp = st.slider(
+        "Temperature (C)", 0.0, 30.0, 15.0, on_change=touch_params,
+        help="Water temperature. Affects sound speed (warmer = faster)."
+    )
+    water_salinity = st.slider(
+        "Salinity (ppt)", 30.0, 40.0, 35.0, on_change=touch_params,
+        help="Water salinity. Affects sound speed and absorption."
+    )
     c1, c2 = st.columns(2)
-    with c1: 
+    with c1:
         b_type = st.selectbox(
             "Seabed", ["Mud", "Sand", "Gravel", "Rock"], index=1, on_change=touch_params,
-            help="Geoacoustic parameters: Impedance contrast and scattering strength (Lambertian mu/n)."
+            help="Seafloor material. Harder surfaces scatter more sound back."
         )
-    with c2: 
+    with c2:
         b_profile = st.selectbox(
             "Bathymetry", ["Flat", "Slope", "Mound", "Trench"], on_change=touch_params,
-            help="Macro-scale seafloor geometry."
+            help="Seafloor shape profile."
         )
     roughness = st.slider(
         "Texture (dB)", 0.0, 5.0, 1.0, on_change=touch_params,
-        help="Statistical micro-roughness amplitude (Speckle noise parameter)."
+        help="Micro-roughness of the seafloor. Higher = more speckle variation."
     )
 
-    # INSTANTIATE MEDIUM EARLY FOR UI CALCULATIONS (UNIFIED C)
-    water_depth = st.number_input(
-        "Water Depth (m)", 5.0, 100.0, 15.0, on_change=touch_params,
-        help="Altitude of the sensor (h) above the seafloor."
+# --- MISSION ---
+with st.sidebar.expander("Mission", expanded=True):
+    speed_mps = st.slider(
+        "Speed (m/s)", 0.5, 5.0, 1.5, on_change=touch_params,
+        help="Tow speed over the seafloor. Affects how densely the seabed is sampled."
+    )
+    ping_rate = st.slider(
+        "Ping Rate (Hz)", 5.0, 30.0, 10.0, on_change=touch_params,
+        help="Pings per second. Higher = denser sampling but shorter max range. (PRF)"
     )
 
-    med_ui = OceanMedium(depth_m=water_depth)
+    med_ui = OceanMedium(temperature_c=water_temp, salinity_ppt=water_salinity, depth_m=water_depth)
     c_sound = med_ui.c
-    limit_r = (c_sound / 2.0) / ping_rate * 0.95 # Safety margin
+    limit_r = (c_sound / 2.0) / ping_rate * 0.95
     default_r = float(min(40000.0 / freq, 600.0))
 
     max_r = st.number_input(
         "Display Range (m)", 10.0, 1000.0, default_r, on_change=touch_params,
-        help="Maximum slant range to simulate. Must be less than c / 2*PRF to avoid aliasing."
+        help="Maximum slant range to simulate. Must be less than c/(2*PRF) to avoid aliasing."
     )
 
-    tilt_angle = st.slider(
-        "Tilt Angle (deg)", 0, 80, 46, on_change=touch_params,
-        help="Depression angle (phi) of the beam axis. 0=Horizontal, 90=Nadir."
-    )
-    beam_v = st.slider(
-        "Vert Beam (deg)", 10, 90, 36, on_change=touch_params,
-        help="Elevation beamwidth (-3dB). Controls swath coverage."
-    )
-    num_cycles = st.slider(
-        "Cycles (N)", 2, 100, 40, on_change=touch_params,
-        help="Pulse duration (tau = N/f). Defines range resolution (DR = c*tau/2)."
-    )
-
-    st.markdown("**Targets**")
+# --- TARGETS ---
+with st.sidebar.expander("Targets", expanded=False):
     show_targets = st.checkbox("Enable Targets", value=True, on_change=touch_params)
-    t1_type = st.selectbox("Type", ["Sphere", "Box"], on_change=touch_params)
+    if show_targets:
+        t1_type = st.selectbox("Type", ["Sphere", "Box"], on_change=touch_params)
+        if "target_y_pos" not in st.session_state:
+            st.session_state.target_y_pos = 10.0
+        st.session_state.target_y_pos = min(st.session_state.target_y_pos, float(max_r))
+        t1_y = st.slider(
+            "Cross Track Y (m)", 0.0, float(max_r), st.session_state.target_y_pos,
+            key="target_y_pos", on_change=touch_params,
+            help="Distance of target from the track line."
+        )
+        t1_s = st.number_input(
+            "Size (m)", 0.1, 5.0, 1.0, on_change=touch_params,
+            help="Target diameter (sphere) or side length (box)."
+        )
+        t1_l = st.slider(
+            "Target Lift (m)", 0.0, 10.0, 4.0, on_change=touch_params,
+            help="Height above seafloor. Higher = longer acoustic shadow."
+        )
+    else:
+        t1_type = "Sphere"; t1_y = 10.0; t1_s = 1.0; t1_l = 4.0
 
-    if "target_y_pos" not in st.session_state:
-        st.session_state.target_y_pos = 10.0
-    st.session_state.target_y_pos = min(st.session_state.target_y_pos, float(max_r))
-    t1_y = st.slider(
-        "Cross Track Y", 0.0, float(max_r), st.session_state.target_y_pos,
-        key="target_y_pos", on_change=touch_params,
-        help="Target range from track."
-    )
-    t1_s = st.number_input(
-        "Size (m)", 0.1, 5.0, 1.0, on_change=touch_params,
-        help="Target characteristic dimension (Diameter or Side Length)."
-    )
-    t1_l = st.slider(
-        "Target Lift (m)", 0.0, 10.0, 4.0, on_change=touch_params,
-        help="Height of target above seafloor (creates acoustic shadow)."
-    )
+# --- DERIVED METRICS ---
+wavelength = c_sound / (freq * 1000.0)
+beam_h_rad = wavelength / aperture_len
+beam_h_deg = np.degrees(beam_h_rad)
+pulse_len_s = num_cycles / (freq * 1000.0)
+dr = c_sound * pulse_len_s / 2.0
+dx = speed_mps / ping_rate
 
-# --- DISPLAY CONTROLS (PURE VIZ) ---
-with st.sidebar.expander("2. Visualization", expanded=True):
-    contrast = st.slider("Contrast", 0.5, 3.0, 1.0, 
-                         help="Linear contrast stretch applied to dB image.")
+st.sidebar.markdown("**Derived Parameters**")
+mc1, mc2 = st.sidebar.columns(2)
+mc1.metric("Sound Speed", f"{c_sound:.0f} m/s")
+mc2.metric("Wavelength", f"{wavelength*1000:.1f} mm")
+mc1.metric("Range Res", f"{dr*100:.1f} cm")
+mc2.metric("Ping Spacing", f"{dx*100:.1f} cm")
+mc1.metric("Horiz Beam", f"{beam_h_deg:.2f} deg")
+
+# --- DISPLAY CONTROLS ---
+with st.sidebar.expander("Visualization", expanded=True):
+    contrast = st.slider("Contrast", 0.5, 3.0, 1.0,
+                         help="Contrast stretch applied to the sonar image.")
     brightness = st.slider("Brightness (dB Offset)", -50.0, 50.0, -10.0,
-                           help="Global gain offset applied to dB image.")
+                           help="Global brightness offset.")
     c_min, c_max = st.slider("dB Clipping Range", -100.0, 20.0, (-60.0, 0.0),
-                             help="Dynamic range limits. Values below Min are black, above Max are white.")
+                             help="Dynamic range limits. Below min = black, above max = white.")
 
 # --- HEADER & LAYOUT ---
 st.markdown(
-    '<div class="fixed-title">SideEye</div>', 
-    unsafe_allow_html=True
-)
-
-st.markdown(
     """
     <style>
-    header[data-testid="stHeader"] {background-color: #0E1117 !important; z-index: 100000 !important;}
     div[data-testid="stSidebarUserContent"] {padding-top: 1.5rem !important;}
-    .fixed-title {position: fixed; top: 14px; left: 380px; z-index: 999999; font-family: "Source Sans Pro", sans-serif; font-weight: 700; font-size: 32px; color: white; pointer-events: none;}
-    div[data-testid="stButton"] {position: fixed; top: 18px; left: 530px; z-index: 999999; width: auto !important; display: inline-block !important;}
-    div[data-testid="stButton"] button {width: auto !important; display: inline-block !important; padding-left: 20px !important; padding-right: 20px !important;}
-    div[data-testid="stProgress"] {position: fixed; top: 25px; left: 750px; width: 250px !important; z-index: 999999;}
-    .block-container {padding-top: 5rem !important;}
+    .block-container {padding-top: 1rem !important;}
     </style>
     """,
     unsafe_allow_html=True
 )
 
 # --- MAIN UI LOGIC ---
-run_btn = st.button("RUN SIMULATION", type="primary", help="Execute Ray Tracing Kernel")
-progress_bar = st.progress(0)
+h1, h2, h3 = st.columns([2, 1, 2])
+with h1:
+    st.markdown("## SideEye")
+with h2:
+    run_btn = st.button("RUN SIMULATION", type="primary", use_container_width=True)
+with h3:
+    progress_bar = st.progress(0)
+
+# Stale-cache indicator
+if st.session_state.raw_data is None and st.session_state.sim_result is not None:
+    st.warning("Parameters changed since last run. Click RUN to update.")
 
 display_params = {'contrast': contrast, 'brightness': brightness, 'clip_min': c_min, 'clip_max': c_max}
 
-# --- REACTIVE CALCS (USING UNIFIED SOUND SPEED) ---
-wavelength = c_sound / (freq * 1000.0)
-beam_h_rad = wavelength / aperture_len
-beam_h_deg = np.degrees(beam_h_rad)
+# --- REACTIVE CALCS ---
 tilt_rad = np.radians(tilt_angle)
 half_beam_rad = np.radians(beam_v / 2)
-
-pulse_len_s = num_cycles / (freq * 1000.0)
-dr = c_sound * pulse_len_s / 2.0
-dx = speed_mps / ping_rate
 
 limit_ping_rate = c_sound / (2.0 * max_r)
 beam_width_at_max = max_r * beam_h_rad
@@ -624,14 +659,15 @@ ax_cross.set_aspect('equal', adjustable='box')
 ax_cross.invert_yaxis()
 
 bathy_y = np.linspace(0, plot_y_max, 100)
-def visual_bathy_local(y_arr):
+def visual_bathy_local(y_arr, max_y):
     z_out = np.zeros_like(y_arr)
     if b_profile == "Flat": return z_out
-    if b_profile == "Slope": return (y_arr / 50.0) * 5.0
-    if b_profile == "Mound": return -3.0 * np.exp(-((y_arr - 25.0)**2) / 25.0)
-    if b_profile == "Trench": return 3.0 * np.exp(-((y_arr - 25.0)**2) / 9.0)
+    if b_profile == "Slope": return (y_arr / max_y) * 5.0
+    center = max_y / 2.0
+    if b_profile == "Mound": return -3.0 * np.exp(-((y_arr - center)**2) / 25.0)
+    if b_profile == "Trench": return 3.0 * np.exp(-((y_arr - center)**2) / 9.0)
     return z_out
-bathy_z = water_depth + visual_bathy_local(bathy_y)
+bathy_z = water_depth + visual_bathy_local(bathy_y, plot_y_max)
 ax_cross.plot(bathy_y, bathy_z, 'brown', lw=2)
 ax_cross.axhline(0, color='blue', ls='--')
 
